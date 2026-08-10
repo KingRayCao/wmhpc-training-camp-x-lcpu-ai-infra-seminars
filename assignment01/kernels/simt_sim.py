@@ -20,4 +20,32 @@ contract: 实现 run(program) -> (regs, cycles)
 
 
 def run(program):
-    raise NotImplementedError("从这里开始写")
+    regs = list(range(32))
+    cycles = run_program(program, regs, [True] * 32)
+    return regs, cycles
+
+def run_program(program, regs, mask):
+    cycles = 0
+    for instr in program:
+        if instr[0] == "add":
+            k = instr[1]
+            for i in range(32):
+                if mask[i]:
+                    regs[i] += k
+            if any(mask):
+                cycles += 1
+        elif instr[0] == "mul":
+            k = instr[1]
+            for i in range(32):
+                if mask[i]:
+                    regs[i] *= k
+            if any(mask):
+                cycles += 1
+        elif instr[0] == "if_lt":
+            t, then_prog, else_prog = instr[1], instr[2], instr[3]
+            then_mask = [mask[i] and regs[i] < t for i in range(32)]
+            else_mask = [mask[i] and not then_mask[i] for i in range(32)]
+            cycles += run_program(then_prog, regs, then_mask)
+            cycles += run_program(else_prog, regs, else_mask)
+
+    return cycles
