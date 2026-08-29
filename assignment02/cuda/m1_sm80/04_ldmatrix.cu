@@ -24,16 +24,56 @@
 // 想清楚哪种布局能满足它。
 //
 // TODO: 实现两个装载函数。
+#define PACK4(p0, p1, p2, p3) ((unsigned)(p0) | (unsigned)(p1) << 8 | (unsigned)(p2) << 16 | (unsigned)(p3) << 24)
+
 __device__ void load_manual(const uint8_t* sA, const uint8_t* sBk,
                             const uint8_t* sBn, unsigned (&a)[4],
                             unsigned (&b)[2]) {
-    (void)sA; (void)sBk; (void)sBn; (void)a; (void)b;
+    int lane = threadIdx.x;
+    int group = lane >> 2;
+    int tig = lane & 3;
+    int tig4 = tig << 2;                            
+    a[0] = PACK4(sA[group * 32 + tig4],
+                 sA[group * 32 + tig4 + 1],
+                 sA[group * 32 + tig4 + 2],
+                 sA[group * 32 + tig4 + 3]);
+    a[1] = PACK4(sA[(group + 8) * 32 + tig4],
+                 sA[(group + 8) * 32 + tig4 + 1],
+                 sA[(group + 8) * 32 + tig4 + 2],
+                 sA[(group + 8) * 32 + tig4 + 3]);
+    a[2] = PACK4(sA[group * 32 + tig4 + 16],
+                 sA[group * 32 + tig4 + 17],
+                 sA[group * 32 + tig4 + 18],
+                 sA[group * 32 + tig4 + 19]);
+    a[3] = PACK4(sA[(group + 8) * 32 + tig4 + 16],
+                 sA[(group + 8) * 32 + tig4 + 17],
+                 sA[(group + 8) * 32 + tig4 + 18],
+                 sA[(group + 8) * 32 + tig4 + 19]);
+    b[0] = PACK4(sBk[(tig4 + 0) * 8 + group],
+                 sBk[(tig4 + 1) * 8 + group],
+                 sBk[(tig4 + 2) * 8 + group],
+                 sBk[(tig4 + 3) * 8 + group]);
+    b[1] = PACK4(sBk[(tig4 + 16) * 8 + group],
+                 sBk[(tig4 + 17) * 8 + group],
+                 sBk[(tig4 + 18) * 8 + group],
+                 sBk[(tig4 + 19) * 8 + group]);
 }
 
 __device__ void load_ldsm(const uint8_t* sA, const uint8_t* sBk,
                           const uint8_t* sBn, unsigned (&a)[4],
                           unsigned (&b)[2]) {
-    (void)sA; (void)sBk; (void)sBn; (void)a; (void)b;
+    int group = threadIdx.x >> 3;
+    int tig = threadIdx.x & 7;
+    unsigned addrA = static_cast<unsigned>(__cvta_generic_to_shared(&sA[((group & 1) * 8 + tig) * 32 + (group >> 1) * 16]));
+    unsigned addrB = static_cast<unsigned>(__cvta_generic_to_shared(&sBn[tig * 32 + group * 16]));
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+        : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3])
+        : "r"(addrA));
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
+        : "=r"(b[0]), "=r"(b[1])
+        : "r"(addrB));
 }
 
 template <bool USE_LDSM>

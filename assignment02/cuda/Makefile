@@ -41,6 +41,8 @@ bin/m4_gemm/%: m4_gemm/%.cu common.h
 run/%: bin/%
 	./$<
 
+.SECONDARY:
+
 ptx/%: %.cu common.h
 	$(NVCC) $(FLAGS) $(GENCODE) -ptx -o $*.ptx $<
 	@echo "已生成 $*.ptx"
