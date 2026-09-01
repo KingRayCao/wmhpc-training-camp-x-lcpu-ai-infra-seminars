@@ -34,8 +34,10 @@ __host__ __device__ inline int swz128(int row, int colByte) {
 }
 
 // SM100 smem descriptor(2.2 的位域)。
-__device__ inline uint64_t make_desc_sm100(uint32_t saddr, uint32_t lbo,
-                                           uint32_t sbo, uint32_t layout) {
+__device__ inline uint64_t make_desc_sm100(uint32_t saddr,
+                                           uint32_t lbo,
+                                           uint32_t sbo,
+                                           uint32_t layout) {
     uint64_t d = 0;
     d |= (uint64_t)((saddr >> 4) & 0x3FFF);
     d |= (uint64_t)((lbo >> 4) & 0x3FFF) << 16;
@@ -56,32 +58,133 @@ __device__ inline void mbar_wait(uint32_t mbar, uint32_t phase) {
             : "r"(mbar), "r"(phase));
 }
 
-__global__ void gemm_tiled(const __nv_bfloat16* gA, const __nv_bfloat16* gB,
-                           float* gD, int M, int N, int K) {
+__global__ void gemm_tiled(const __nv_bfloat16* gA,
+                           const __nv_bfloat16* gB,
+                           float* gD,
+                           int M,
+                           int N,
+                           int K) {
     // smem 用动态分配(main 已按 (BM+BN)*BK*2 + 1024 传入),基址对齐
     // 到 1024(swizzle atom 的要求);A 区 [0, BM*BK*2),B 区随后。
     extern __shared__ uint8_t smem_raw[];
-    uint8_t* smem =
-        (uint8_t*)(((uintptr_t)smem_raw + 1023) & ~(uintptr_t)1023);
+    uint8_t* smem = (uint8_t*)(((uintptr_t)smem_raw + 1023) & ~(uintptr_t)1023);
+    uint8_t *sA = smem, *sB = smem + BM * BK * 2;
 
+    __shared__ __align__(8) uint64_t mbar;
+    __shared__ uint32_t s_taddr[1];
+    int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    uint32_t mbar_u32 = (uint32_t)__cvta_generic_to_shared(&mbar);
+    uint32_t phase = 0;
     // TODO:在你 3.2 的实现基础上扩展。结构:
     // (1) mbarrier 初始化 + TMEM 分配(与 3.2 相同,整段沿用)
+    if (warp == 0) {
+        if (lane == 0) {
+            asm volatile(
+                "mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(mbar_u32),
+                "r"(1));
+            asm volatile("fence.mbarrier_init.release.cluster;");
+        }
+        uint32_t dst = (uint32_t)__cvta_generic_to_shared(s_taddr);
+        asm volatile(
+            "tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], "
+            "%1;" ::"r"(dst),
+            "r"(BN));
+        asm volatile(
+            "tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
+    }
+    __syncthreads();
+    uint32_t taddr = s_taddr[0];
+
     // (2) 本 block 的输出 tile:tileM = blockIdx.x*BM, tileN = blockIdx.y*BN
+    int tileM = blockIdx.x * BM, tileN = blockIdx.y * BN;
+
     // (3) K 维循环 it = 0 .. K/BK-1,每轮:
-    //     (a) 全体线程把 A 的 (tileM, it*BK) 块、B 的 (tileN, it*BK) 块
-    //         按 swz128 布局 st.shared 进 smem(即 3.2 的 staging,行列
-    //         起点换成 tile 偏移)
-    //     (b) fence.proxy.async + __syncthreads
-    //     (c) 单线程发射 4 条 k16 的 tcgen05.mma。注意累加位:整个 K
-    //         循环里只有第一条 mma 不累加(enable-input-d = 0),其余
-    //         全部累加到同一块 TMEM——3.2 里"kk>0 才累加"的条件在这里
-    //         要连 it 一起考虑
-    //     (d) commit 到 mbarrier,等 mma 消费完成后才能进入下一轮覆写
-    //         smem。想清楚 parity 怎么随 it 翻转;这一步等错或漏等,
-    //         小 K 可能侥幸通过,大 K 会读到被覆写的数据
+    for (int it = 0; it < K; it += BK) {
+        //     (a) 全体线程把 A 的 (tileM, it*BK) 块、B 的 (tileN, it*BK) 块
+        //         按 swz128 布局 st.shared 进 smem(即 3.2 的 staging,行列
+        //         起点换成 tile 偏移)
+        for (int i = tid; i < BM * BK; i += blockDim.x) {
+            int r = i / BK, k = i % BK;
+            int gA_idx = (tileM + r) * K + (it + k);
+            *reinterpret_cast<__nv_bfloat16*>(&sA[swz128(r, k * 2)]) =
+                gA[gA_idx];
+        }
+        for (int i = tid; i < BN * BK; i += blockDim.x) {
+            int n = i / BK, k = i % BK;
+            int gB_idx = (tileN + n) * K + (it + k);
+            *reinterpret_cast<__nv_bfloat16*>(&sB[swz128(n, k * 2)]) =
+                gB[gB_idx];
+        }
+        //     (b) fence.proxy.async + __syncthreads
+        asm volatile("fence.proxy.async.shared::cta;");
+        __syncthreads();
+        //     (c) 单线程发射 4 条 k16 的 tcgen05.mma。注意累加位:整个 K
+        //         循环里只有第一条 mma 不累加(enable-input-d = 0),其余
+        //         全部累加到同一块 TMEM——3.2 里"kk>0 才累加"的条件在这里
+        //         要连 it 一起考虑
+        uint32_t elected;
+        asm volatile(
+            "{\n.reg .pred P;\nelect.sync _|P, 0xFFFFFFFF;\nselp.b32 %0, 1, 0, "
+            "P;\n}"
+            : "=r"(elected));
+        uint32_t aBase = (uint32_t)__cvta_generic_to_shared(sA);
+        uint32_t bBase = (uint32_t)__cvta_generic_to_shared(sB);
+        uint32_t idesc =
+            (1u << 4) | (1u << 7) | (1u << 10) | (8u << 17) | (8u << 24);
+        if (warp == 0 && elected) {
+            for (int round = 0; round < BK / 16; round++) {
+                int kk = round * 16;
+
+                asm volatile("tcgen05.fence::after_thread_sync;");
+                uint64_t da = make_desc_sm100(aBase + kk * 2, 0, 1024, 2);
+                uint64_t db = make_desc_sm100(bBase + kk * 2, 0, 1024, 2);
+                uint32_t accum = (round == 0 && it == 0) ? 0 : 1;
+                asm volatile(
+                    "{\n.reg .pred p;\nsetp.ne.b32 p, %4, 0;\n"
+                    "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, "
+                    "p;\n}\n"
+                    :
+                    : "r"(taddr), "l"(da), "l"(db), "r"(idesc), "r"(accum)
+                    : "memory");
+            }
+            //     (d) commit 到 mbarrier,等 mma 消费完成后才能进入下一轮覆写
+            //         smem。想清楚 parity 怎么随 it 翻转;这一步等错或漏等,
+            //         小 K 可能侥幸通过,大 K 会读到被覆写的数据
+            asm volatile(
+                "tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::"
+                "cluster.b64 [%0];"
+                :
+                : "r"(mbar_u32)
+                : "memory");
+        }
+        mbar_wait(mbar_u32, phase);
+        phase ^= 1;
+    }
     // (4) epilogue 与 3.2 相同,写回 gD 的 (tileM, tileN) 块(行跨度 N)
-    // (5) dealloc
-    (void)gA; (void)gB; (void)gD; (void)M; (void)N; (void)K; (void)smem;
+    asm volatile("tcgen05.fence::after_thread_sync;");
+    for (int c = 0; c < BN; c += 8) {
+        uint32_t src = taddr + ((uint32_t)(warp * 32) << 16) + c;
+        float r[8];
+        asm volatile(
+            "tcgen05.ld.sync.aligned.32x32b.x8.b32 "
+            "{%0,%1,%2,%3,%4,%5,%6,%7}, [%8];"
+            : "=f"(r[0]), "=f"(r[1]), "=f"(r[2]), "=f"(r[3]), "=f"(r[4]),
+              "=f"(r[5]), "=f"(r[6]), "=f"(r[7])
+            : "r"(src));
+        asm volatile("tcgen05.wait::ld.sync.aligned;");
+        int row = warp * 32 + lane;
+#pragma unroll
+        for (int i = 0; i < 8; i++)
+            gD[(row + tileM) * N + tileN + c + i] = r[i];
+        __syncthreads();
+    }
+
+    __syncthreads();
+    if (warp == 0)
+        asm volatile(
+            "tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" ::"r"(
+                taddr),
+            "r"(64));
 }
 
 int main(int argc, char** argv) {
@@ -96,8 +199,10 @@ int main(int argc, char** argv) {
     std::mt19937 rng(42);
     std::uniform_int_distribution<int> dist(-3, 3);
     std::vector<__nv_bfloat16> hA(nA), hB(nB);
-    for (auto& v : hA) v = __float2bfloat16((float)dist(rng));
-    for (auto& v : hB) v = __float2bfloat16((float)dist(rng));
+    for (auto& v : hA)
+        v = __float2bfloat16((float)dist(rng));
+    for (auto& v : hB)
+        v = __float2bfloat16((float)dist(rng));
     __nv_bfloat16 *dA, *dB;
     float *dD, *dRef;
     CUDA_CHECK(cudaMalloc(&dA, nA * 2));
@@ -133,7 +238,8 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMemcpy(got.data(), dD, nD * 4, cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(ref.data(), dRef, nD * 4, cudaMemcpyDeviceToHost));
     long bad = 0;
-    for (size_t i = 0; i < nD; i++) bad += got[i] != ref[i];
+    for (size_t i = 0; i < nD; i++)
+        bad += got[i] != ref[i];
 
     int iters = (size_t)M * N >= (size_t)4096 * 4096 ? 20 : 100;
     float ms = time_avg_ms(launch, iters);
@@ -147,10 +253,11 @@ int main(int argc, char** argv) {
         },
         iters);
     double cub_tflops = 2.0 * M * N * K / (cub_ms * 1e9);
-    printf("[4.1 tiled] M=%d N=%d K=%d  %s(bad=%ld)  %.2f ms  %.1f TFLOPS  "
-           "(cuBLAS %.1f, 达成率 %.0f%%)\n",
-           M, N, K, bad ? "FAIL" : "PASS", bad, ms, tflops, cub_tflops,
-           100.0 * tflops / cub_tflops);
+    printf(
+        "[4.1 tiled] M=%d N=%d K=%d  %s(bad=%ld)  %.2f ms  %.1f TFLOPS  "
+        "(cuBLAS %.1f, 达成率 %.0f%%)\n",
+        M, N, K, bad ? "FAIL" : "PASS", bad, ms, tflops, cub_tflops,
+        100.0 * tflops / cub_tflops);
     cublasDestroy(h);
     return bad != 0;
 }

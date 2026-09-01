@@ -46,8 +46,10 @@
 constexpr int BM = 128, BN = 64, BK = 64;
 constexpr int NSTAGE = STAGES;
 
-__device__ inline uint64_t make_desc_sm100(uint32_t saddr, uint32_t lbo,
-                                           uint32_t sbo, uint32_t layout) {
+__device__ inline uint64_t make_desc_sm100(uint32_t saddr,
+                                           uint32_t lbo,
+                                           uint32_t sbo,
+                                           uint32_t layout) {
     uint64_t d = 0;
     d |= (uint64_t)((saddr >> 4) & 0x3FFF);
     d |= (uint64_t)((lbo >> 4) & 0x3FFF) << 16;
@@ -57,7 +59,7 @@ __device__ inline uint64_t make_desc_sm100(uint32_t saddr, uint32_t lbo,
     return d;
 }
 
-__device__ inline void mbar_wait(uint32_t mbar, uint32_t phase) {
+__device__ inline void mbar_wait(uint32_t mbar, uint32_t* phase) {
     uint32_t done = 0;
     while (!done)
         asm volatile(
@@ -65,28 +67,51 @@ __device__ inline void mbar_wait(uint32_t mbar, uint32_t phase) {
             "mbarrier.try_wait.parity.shared::cta.b64 p, [%1], %2;\n"
             "selp.b32 %0, 1, 0, p;\n}"
             : "=r"(done)
-            : "r"(mbar), "r"(phase));
+            : "r"(mbar), "r"(*phase));
+    *phase ^= 1;
 }
 
 // 非阻塞版:成功返回 true。机会式深预取用它。
-__device__ inline bool mbar_try(uint32_t mbar, uint32_t phase) {
+__device__ inline bool mbar_try(uint32_t mbar, uint32_t* phase) {
     uint32_t done;
     asm volatile(
         "{\n.reg .pred p;\n"
         "mbarrier.try_wait.parity.shared::cta.b64 p, [%1], %2;\n"
         "selp.b32 %0, 1, 0, p;\n}"
         : "=r"(done)
-        : "r"(mbar), "r"(phase));
+        : "r"(mbar), "r"(*phase));
+    if (done)
+        *phase ^= 1;
     return done;
 }
 
-__global__ void gemm_pipeline(const __nv_bfloat16* gA, const __nv_bfloat16* gB,
-                              float* gD, int M, int N, int K,
+// 每个 stage 的 full barrier 先登记 A+B 的总字节数，再分别发两条 TMA。
+#define MBAR_ARRIVE_EXPECT_TX(MBAR, BYTES)                                \
+    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" \
+                 :                                                        \
+                 : "r"(MBAR), "r"(BYTES)                                  \
+                 : "memory")
+
+// TMAP_ADDR 是设备端 tensor-map 参数的地址，例如 &tmapA。
+#define TMA_SEND_2D(DST, TMAP_ADDR, COORD0, COORD1, MBAR)               \
+    asm volatile(                                                       \
+        "cp.async.bulk.tensor.2d.shared::cluster.global.tile."          \
+        "mbarrier::complete_tx::bytes "                                 \
+        "[%0], [%1, {%2, %3}], [%4];"                                   \
+        :                                                               \
+        : "r"(DST), "l"(TMAP_ADDR), "r"(COORD0), "r"(COORD1), "r"(MBAR) \
+        : "memory")
+
+__global__ void gemm_pipeline(const __nv_bfloat16* gA,
+                              const __nv_bfloat16* gB,
+                              float* gD,
+                              int M,
+                              int N,
+                              int K,
                               const __grid_constant__ CUtensorMap tmapA,
                               const __grid_constant__ CUtensorMap tmapB) {
     extern __shared__ uint8_t smem_raw[];
-    uint8_t* smem =
-        (uint8_t*)(((uintptr_t)smem_raw + 1023) & ~(uintptr_t)1023);
+    uint8_t* smem = (uint8_t*)(((uintptr_t)smem_raw + 1023) & ~(uintptr_t)1023);
 
     // TODO:把你 4.2 的 kernel 扩成 NSTAGE 级流水。参考结构:
     // (1) smem 划成 NSTAGE 段,stage s 的 A/B 起点自己排;mbarrier 每
@@ -103,8 +128,175 @@ __global__ void gemm_pipeline(const __nv_bfloat16* gA, const __nv_bfloat16* gB,
     //       → mma(与 4.2 相同,累加位口径不变)→ commit 到
     //       empty[it%NSTAGE]
     // (4) drain:等最后一轮 mma 的 empty 到达,再进 epilogue
-    (void)gA; (void)gB; (void)gD; (void)M; (void)N; (void)K;
-    (void)tmapA; (void)tmapB; (void)smem;
+    uint32_t aBase[NSTAGE], bBase[NSTAGE];
+    __shared__ uint64_t mbar_full[NSTAGE], mbar_empty[NSTAGE];
+    uint32_t mbar_full_u32[NSTAGE], mbar_empty_u32[NSTAGE];
+    uint32_t phase_full[NSTAGE], phase_empty[NSTAGE];
+    __shared__ uint32_t s_taddr[1];
+    int iters = K / BK;
+    int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    int next_to_issue = 0;
+    // int issued[NSTAGE];
+#pragma unroll
+    for (int i = 0; i < NSTAGE; i++) {
+        aBase[i] = (uint32_t)__cvta_generic_to_shared(
+            smem + i * (BM + BN) * BK * sizeof(__nv_bfloat16));
+        bBase[i] = (uint32_t)__cvta_generic_to_shared(
+            smem + BM * BK * sizeof(__nv_bfloat16) +
+            i * (BM + BN) * BK * sizeof(__nv_bfloat16));
+        mbar_full_u32[i] = (uint32_t)__cvta_generic_to_shared(&mbar_full[i]);
+        mbar_empty_u32[i] = (uint32_t)__cvta_generic_to_shared(&mbar_empty[i]);
+        phase_full[i] = phase_empty[i] = 0;
+        // issued[i] = -1;
+    }
+
+    if (warp == 0) {
+        if (lane == 0) {
+#pragma unroll
+            for (int i = 0; i < NSTAGE; i++) {
+                asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
+                             :
+                             : "r"(mbar_full_u32[i]), "r"(1));
+                asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
+                             :
+                             : "r"(mbar_empty_u32[i]), "r"(1));
+            }
+            asm volatile("fence.mbarrier_init.release.cluster;");
+        }
+        uint32_t dst = (uint32_t)__cvta_generic_to_shared(s_taddr);
+        asm volatile(
+            "tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], "
+            "%1;" ::"r"(dst),
+            "r"(BN));
+        asm volatile(
+            "tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
+    }
+    __syncthreads();
+    uint32_t taddr = s_taddr[0];
+
+    uint32_t tileM = blockIdx.x * BM, tileN = blockIdx.y * BN;
+    uint32_t tmaBytes = (BM + BN) * BK * sizeof(__nv_bfloat16);
+    uint32_t idesc =
+        (1u << 4) | (1u << 7) | (1u << 10) | (8u << 17) | (8u << 24);
+    // 预热
+    for (int it = 0; it < min(NSTAGE, iters); it++) {
+        if (warp == 0 && lane == 0) {
+            int it_kk = it * BK;
+            MBAR_ARRIVE_EXPECT_TX(mbar_full_u32[it], tmaBytes);
+            TMA_SEND_2D(aBase[it], &tmapA, it_kk, tileM, mbar_full_u32[it]);
+            TMA_SEND_2D(bBase[it], &tmapB, it_kk, tileN, mbar_full_u32[it]);
+            // issued[it] = it;
+            next_to_issue++;
+        }
+    }
+
+    __syncthreads();
+
+    // 主循环
+    for (int it = 0; it < iters; it++) {
+        int it_kk = it * BK;
+        int stage = it % NSTAGE;
+        if (warp == 0 && lane == 0) {
+            // 强制发射:若第 it 轮 TMA 还没发,阻塞等 empty[stage] 后补发
+            if (next_to_issue == it) {
+                mbar_wait(mbar_empty_u32[stage], &phase_empty[stage]);
+                MBAR_ARRIVE_EXPECT_TX(mbar_full_u32[stage], tmaBytes);
+                TMA_SEND_2D(aBase[stage], &tmapA, it_kk, tileM,
+                            mbar_full_u32[stage]);
+                TMA_SEND_2D(bBase[stage], &tmapB, it_kk, tileN,
+                            mbar_full_u32[stage]);
+                // issued[stage] = it;
+                next_to_issue++;
+            }
+            // 机会式深预取:try_wait 下一个待发 stage 的
+            // empty,成功就继续发,失败立刻停
+            while (next_to_issue < iters) {
+                int next_stage = next_to_issue % NSTAGE;
+                if (mbar_try(mbar_empty_u32[next_stage],
+                             &phase_empty[next_stage])) {
+                    int next_it_kk = next_to_issue * BK;
+                    MBAR_ARRIVE_EXPECT_TX(mbar_full_u32[next_stage], tmaBytes);
+                    TMA_SEND_2D(aBase[next_stage], &tmapA, next_it_kk, tileM,
+                                mbar_full_u32[next_stage]);
+                    TMA_SEND_2D(bBase[next_stage], &tmapB, next_it_kk, tileN,
+                                mbar_full_u32[next_stage]);
+                    // issued[next_stage] = next_it;
+                    next_to_issue++;
+                }
+                else
+                    break;
+            }
+        }
+
+        __syncthreads();
+
+        // 等 full[it%NSTAGE](parity = (it/NSTAGE)&1)→ tcgen05.fence → mma →
+        // commit 到 empty[it%NSTAGE]
+        // uint32_t elected;
+        // asm volatile(
+        //     "{\n.reg .pred P;\nelect.sync _|P, 0xFFFFFFFF;\nselp.b32 %0, 1,
+        //     0, " "P;\n}" : "=r"(elected));
+
+        if (warp == 0 && lane == 0) {
+            mbar_wait(mbar_full_u32[stage], &phase_full[stage]);
+            for (int round = 0; round < BK / 16; round++) {
+                int kk = round * 16;
+
+                asm volatile("tcgen05.fence::after_thread_sync;");
+                uint64_t da =
+                    make_desc_sm100(aBase[stage] + kk * 2, 0, 1024, 2);
+                uint64_t db =
+                    make_desc_sm100(bBase[stage] + kk * 2, 0, 1024, 2);
+                uint32_t accum = (round == 0 && it == 0) ? 0 : 1;
+                asm volatile(
+                    "{\n.reg .pred p;\nsetp.ne.b32 p, %4, 0;\n"
+                    "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, "
+                    "p;\n}\n"
+                    :
+                    : "r"(taddr), "l"(da), "l"(db), "r"(idesc), "r"(accum)
+                    : "memory");
+            }
+
+            asm volatile(
+                "tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::"
+                "cluster.b64 [%0];"
+                :
+                : "r"(mbar_empty_u32[stage])
+                : "memory");
+        }
+    }
+
+    // drain:等最后一轮 mma 的 empty 到达,再进 epilogue
+    if (warp == 0 && lane == 0) {
+        mbar_wait(mbar_empty_u32[(iters - 1) % NSTAGE],
+                  &phase_empty[(iters - 1) % NSTAGE]);
+    }
+
+    __syncthreads();
+    asm volatile("tcgen05.fence::after_thread_sync;");
+    for (int c = 0; c < BN; c += 8) {
+        uint32_t src = taddr + ((uint32_t)(warp * 32) << 16) + c;
+        float r[8];
+        asm volatile(
+            "tcgen05.ld.sync.aligned.32x32b.x8.b32 "
+            "{%0,%1,%2,%3,%4,%5,%6,%7}, [%8];"
+            : "=f"(r[0]), "=f"(r[1]), "=f"(r[2]), "=f"(r[3]), "=f"(r[4]),
+              "=f"(r[5]), "=f"(r[6]), "=f"(r[7])
+            : "r"(src));
+        asm volatile("tcgen05.wait::ld.sync.aligned;");
+        int row = warp * 32 + lane;
+#pragma unroll
+        for (int i = 0; i < 8; i++)
+            gD[(row + tileM) * N + tileN + c + i] = r[i];
+        __syncthreads();
+    }
+    // (5) dealloc
+    __syncthreads();
+    if (warp == 0)
+        asm volatile(
+            "tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" ::"r"(
+                taddr),
+            "r"(64));
 }
 
 int main(int argc, char** argv) {
@@ -119,8 +311,10 @@ int main(int argc, char** argv) {
     std::mt19937 rng(42);
     std::uniform_int_distribution<int> dist(-3, 3);
     std::vector<__nv_bfloat16> hA(nA), hB(nB);
-    for (auto& v : hA) v = __float2bfloat16((float)dist(rng));
-    for (auto& v : hB) v = __float2bfloat16((float)dist(rng));
+    for (auto& v : hA)
+        v = __float2bfloat16((float)dist(rng));
+    for (auto& v : hB)
+        v = __float2bfloat16((float)dist(rng));
     __nv_bfloat16 *dA, *dB;
     float *dD, *dRef;
     CUDA_CHECK(cudaMalloc(&dA, nA * 2));
@@ -133,6 +327,32 @@ int main(int argc, char** argv) {
 
     // TODO:tensor map 从你的 4.2 原样复制。
     CUtensorMap tmapA = {}, tmapB = {};
+    uint64_t globalDimA[2] = {(uint64_t)K, (uint64_t)M};
+    uint64_t globalDimB[2] = {(uint64_t)K, (uint64_t)N};
+    uint64_t globalStrides[1] = {(uint64_t)K * 2};
+    uint32_t boxDimA[2] = {BK, BM};
+    uint32_t boxDimB[2] = {BK, BN};
+    uint32_t elementStrides[2] = {1, 1};
+    CU_CHECK(cuTensorMapEncodeTiled(
+        &tmapA, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+        2,               // 二维
+        dA,              // global memory 基址
+        globalDimA,      // {K, M}
+        globalStrides,   // {K * sizeof(bf16)}
+        boxDimA,         // {BK, BM}
+        elementStrides,  // {1, 1}
+        CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
+        CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+    CU_CHECK(cuTensorMapEncodeTiled(
+        &tmapB, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+        2,               // 二维
+        dB,              // global memory 基址
+        globalDimB,      // {K, N}
+        globalStrides,   // {K * sizeof(bf16)}
+        boxDimB,         // {BK, BN}
+        elementStrides,  // {1, 1}
+        CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
+        CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
 
     dim3 grid(M / BM, N / BN);
     // NSTAGE=3 时 72KB+对齐余量,超 48KB 静态上限,动态 smem 必须。
@@ -158,7 +378,8 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMemcpy(got.data(), dD, nD * 4, cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(ref.data(), dRef, nD * 4, cudaMemcpyDeviceToHost));
     long bad = 0;
-    for (size_t i = 0; i < nD; i++) bad += got[i] != ref[i];
+    for (size_t i = 0; i < nD; i++)
+        bad += got[i] != ref[i];
 
     int iters = (size_t)M * N >= (size_t)4096 * 4096 ? 20 : 100;
     float ms = time_avg_ms(launch, iters);
@@ -172,10 +393,11 @@ int main(int argc, char** argv) {
         },
         iters);
     double cub_tflops = 2.0 * M * N * K / (cub_ms * 1e9);
-    printf("[4.3 pipeline S=%d] M=%d N=%d K=%d  %s(bad=%ld)  %.2f ms  %.1f "
-           "TFLOPS  (cuBLAS %.1f, 达成率 %.0f%%)\n",
-           NSTAGE, M, N, K, bad ? "FAIL" : "PASS", bad, ms, tflops,
-           cub_tflops, 100.0 * tflops / cub_tflops);
+    printf(
+        "[4.3 pipeline S=%d] M=%d N=%d K=%d  %s(bad=%ld)  %.2f ms  %.1f "
+        "TFLOPS  (cuBLAS %.1f, 达成率 %.0f%%)\n",
+        NSTAGE, M, N, K, bad ? "FAIL" : "PASS", bad, ms, tflops, cub_tflops,
+        100.0 * tflops / cub_tflops);
     cublasDestroy(h);
     return bad != 0;
 }

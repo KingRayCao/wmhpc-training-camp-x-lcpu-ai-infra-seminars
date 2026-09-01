@@ -306,30 +306,37 @@ offset = atom * (period * rowBytes)
 
 先运行错误版本并记录：
 
-| rounds | 输出/是否超时 | 复现条件 |
-| ---: | --- | --- |
-| 1 | | |
-| 2 | | |
-| 4 | | |
+| rounds | 输出/是否超时 |
+| ---: | --- |
+| 1 | PASS |
+| 2 | 超时 |
+| 4 | 超时 |
 
 正确状态机：初始化 phase=0、arrival count=1；每轮 `commit.arrive` 使计数满足后放行，等待该轮 phase；下一轮 phase 翻转（0→1→0…），并重新使用新的 arrival 计数。错误版本若始终等待 phase=0，第二轮起可能过早放行或永久等待；同时 `tcgen05.ld` 本身必须等待尚未完成的 mma，不能只依赖错误的 barrier phase。
 
-| 项目 | 填写 |
-| --- | --- |
-| 错误版本状态图（phase/count） | |
-| 修复位置 | |
-| 修复后 `judge_mbar.sh` | |
-
 ### 3.4 CTA pair
 
-(a) `cta_group::1` 的每个 CTA 保存完整 B tile；`cta_group::2` 将 N 对半切分，因此每个 CTA 的 B shared memory 约为前者的 **1/2**。两种实现每 CTA 都分配 64 个 TMEM columns，因而每 CTA 的 TMEM 占用不变；两个 CTA 合计的任务总 TMEM 容量也不变。具体程序打印值待填写。
+(a) `cta_group::1` 的每个 CTA 保存完整 B tile；`cta_group::2` 将 N 对半切分，因此每个 CTA 的 B shared memory 约为前者的 **1/2**。两种实现每 CTA 都分配 64 个 TMEM columns，因而每 CTA 的 TMEM 占用不变；两个 CTA 合计的任务总 TMEM 容量也不变。
 
-(b) Nsight Compute 流量：
+实际打印：`smem/block: cta_group::1 = 24588 B, cta_group::2 = 20492 B`，正好相差一半的 B 矩阵大小。
 
-| 变体 | staging store | Tensor Core shared wavefront | 总 shared 流量 |
+(b) 使用以下命令进行统计：
+
+```sh
+ncu \
+  --kernel-name-base demangled \
+  --kernel-name "regex:tile_kernel.*1" \
+  --launch-count 1 \
+  --metrics l1tex__data_pipe_lsu_wavefronts_mem_shared_op_ld.sum,l1tex__data_pipe_lsu_wavefronts_mem_shared_op_st.sum \
+  ./bin/m3_tcgen05/04_cta_pair
+```
+
+Nsight Compute 流量：
+
+| 变体 | shared load wavefront | shared store wavefront | 合计 |
 | --- | ---: | ---: | ---: |
-| `cta_group::1` | | | |
-| `cta_group::2` | | | |
+| `cta_group::1` | 26 | 778 | 804 |
+| `cta_group::2` | 29 | 650 | 679 |
 
 (c) 省出的 shared memory 可用于增加 pipeline stage、扩大 tile、放置双缓冲/更多 TMA 暂存，从而提高预取与计算重叠。
 
@@ -342,62 +349,117 @@ offset = atom * (period * rowBytes)
 | 实现 | TFLOPS | 对 cuBLAS 达成率 | 时间主要花在哪 |
 | --- | ---: | ---: | --- |
 | naive（assignment01，fp32） | | | |
-| 4.1 tiled | | | |
-| 4.2 TMA | | | |
-| 4.3 pipeline（S=3） | | | |
-| cuBLAS | | 100% | |
+| 4.1 tiled | 29.5 | 3% | 逐元素 global→shared staging 及其 long-scoreboard 依赖 |
+| 4.2 TMA | 340.3 | 33% | 单缓冲下等待 mma 消费完成（empty barrier） |
+| 4.3 pipeline（S=3） | 257.9 | 24% | 多级 shared buffer 降低 block 驻留数，CTA 间延迟隐藏能力下降 |
+| cuBLAS | 约 1040 | 100% | Tensor Core 主路径 |
+
+4.1 与 4.2 在同一个 Slurm allocation 中依次运行；两者均为 `M=N=K=4096` 且判测 PASS。
 
 ### 4.1 tiled
 
-实现 grid 覆盖所有输出 tile，K 维循环中用 `st.shared` + swizzle staging，mma 结果在 TMEM 中累加。判测与性能：
+实现 grid 覆盖所有输出 tile，K 维循环中用 `st.shared` + swizzle staging，mma 结果在 TMEM 中累加。
 
-```text
-make run/m4_gemm/01_tiled
-输出：
-```
+实测 `4.65 ms / 29.5 TFLOPS`，同轮 cuBLAS 为 `1035.2 TFLOPS`，达成率约 `3%`。结合机器平衡点，该版本主要受普通 CUDA 指令执行的 staging 和同步限制，并未打满 HBM 或 Tensor Core。
 
-结合机器平衡点，单缓冲 tiled 版本通常仍受数据搬运、同步和 shared staging 限制；最终判断以 Nsight/实测 TFLOPS 填写。
+Nsight Compute source report 显示，最高采样和绝大多数 long-scoreboard stall 集中在第 112、118 行的 A/B staging store（`ST.E.U16`）。4.1 的 staging 成本包括逐元素 global 地址计算、global load、`swz128` 地址计算、shared store、循环控制、proxy fence 和 CTA 同步。报告中 `SM Busy=24.18%`、`No Eligible=75.66%`、`DRAM Throughput=0.31%`；`BAR.SYNC` 和 `LDTM.x8` 有一定等待，但不是主导因素。
 
 ### 4.2 TMA
 
-TMA 将 global→shared 的地址计算、线程逐元素 load 和部分同步工作交给 `cuTensorMapEncodeTiled` + `cp.async.bulk.tensor` + mbarrier `expect_tx`。仍保留单缓冲，因此 TMA 减少了 staging 指令开销，但不能自动隐藏当前 tile 的搬运延迟。
+TMA 将二维地址生成、global load、swizzled shared store 和逐元素循环从普通 CUDA 指令转交给硬件，由 `CUtensorMap`、`cp.async.bulk.tensor` 和 mbarrier `expect_tx` 描述搬运。实测 `0.40 ms / 340.3 TFLOPS`，同轮 cuBLAS 为 `1040.0 TFLOPS`，达成率约 `33%`，相对 4.1 提升约 `11.5×`。
 
-```text
-make run/m4_gemm/02_tma
-输出：
-```
-
-Nsight 观察（待填写）：
+Nsight Compute 显示 `SM Busy=42.32%`、Tensor pipeline 利用率 `26.27%`、`DRAM Throughput=4.45%`、`No Eligible=86.54%`。stall samples 中 long scoreboard 为 `6554/11355≈58%`，barrier 为 `1244/11355≈11%`。最大热点是第 192 行 `mbar_wait(mbar_empty_u32, phase_empty)` 对应的等待循环（约 4042 samples），说明单缓冲主要等待本轮 mma 消费完 shared memory，才能让下一轮 TMA 覆写。等待 TMA 数据到达的 full barrier 只有约 26 个聚合 samples，并非主要瓶颈；第 154 行 `__syncthreads()` 有 839 samples，其中 830 为 barrier stall，有可见但次要的开销。
 
 | 指标/时间段 | 4.1 tiled | 4.2 TMA |
 | --- | ---: | ---: |
-| shared staging 指令/时间 | | |
-| TMA/同步时间 | | |
-| mma/TMEM 时间 | | |
+| 正常运行时间 | 4.65 ms | 0.40 ms |
+| SM Busy | 24.18% | 42.32% |
+| No Eligible | 75.66% | 86.54% |
+| DRAM Throughput | 0.31% | 4.45% |
+| 主要 source hotspot | A/B `ST.E.U16` staging | `mbar_wait(empty)` |
 
 ### 4.3 多级流水
 
-运行 `STAGES=2,3,4,6` 的性能表：
+在同一个 Slurm allocation 中运行 `sweep_stages.sh`，所有配置均严格对拍
+PASS。`4096³` 的 S=3 用时 `0.53 ms`，性能为 `257.9 TFLOPS`，同轮
+cuBLAS 为 `1059.8 TFLOPS`，达成率为 `24%`。
 
 | 形状 | S=2 | S=3 | S=4 | S=6 |
 | --- | ---: | ---: | ---: | ---: |
-| 4096³ | | | | |
-| 256×4096×16384 | | | | |
+| 4096³ | 294.3 | 257.9 | 209.0 | 121.8 |
+| 256×4096×16384 | 114.4 | 115.2 | 114.5 | 114.4 |
 
-流水时空图（选择一个 S，标出每个 stage 的 TMA 与 mma 重叠）：
+表中单位为 TFLOPS。每个 stage 保存一个 `128×64` 的 A tile 和一个
+`64×64` 的 B tile，因此每 stage 的数据区为
+
+$$
+(BM+BN)BK\times 2=(128+64)\times64\times2=24576\ \text{B}.
+$$
+
+kernel 还为 1024 B 对齐余量申请动态 shared memory。Nsight Compute 的
+LaunchStats/Occupancy 结果如下：
+
+| S | 动态 shared/block | shared 限制的 blocks/SM | 理论 occupancy |
+| ---: | ---: | ---: | ---: |
+| 2 | 50176 B | 4 | 25.00% |
+| 3 | 74752 B | 3 | 18.75% |
+| 4 | 99328 B | 2 | 12.50% |
+| 6 | 148480 B | 1 | 6.25% |
+
+`4096³` 有 `(4096/128)×(4096/64)=2048` 个 CTA，grid 足够大，多个
+resident CTA 本身可以隐藏 TMA、mbarrier 和 mma 的延迟。S 从 2 增至 6
+时，每 SM 可驻留 CTA 数从 4 降至 1，损失的 CTA 间并发大于更深预取带来
+的收益，因此性能单调下降。这里不能得出“stage 越多越快”的结论。
+
+`256×4096×16384` 只有 `2×64=128` 个 CTA，但每个 CTA 有 256 个 K tile。
+这个 grid 在该 GPU 上本来就难以让每个 SM 同时驻留多个 CTA，所以增大 S
+几乎没有进一步损失 block 间并发；与此同时 S=2 已足以覆盖当前 TMA/mma
+流水的主要延迟，S=3、4、6 也没有可测的额外收益，四个结果都在
+`114--115 TFLOPS` 的波动范围内。
+
+选择 S=3。每个 stage 内必须先 TMA 写满，再由 mma 读取，mma 完成并通知
+`empty[s]` 后该 stage 才能被下一轮 TMA 覆写；重叠发生在不同 stage 之间：
 
 ```text
-时间 →
-stage 0:  [TMA] [mma] [TMA] [mma] ...
-stage 1:        [TMA] [mma] [TMA] ...
-stage 2:              [TMA] [mma] ...
+时间片        t0       t1       t2       t3       t4       t5
+stage 0     TMA k0   MMA k0                    TMA k3   MMA k3
+stage 1              TMA k1   MMA k1                    TMA k4
+stage 2                       TMA k2   MMA k2                    ...
+
+跨 stage 重叠          TMA k1 与 MMA k0
+                      TMA k2 与 MMA k1
+                      TMA k3 与 MMA k2
 ```
 
-回答：
+图是依赖关系示意，不表示各操作等时长。`full[s]` 保证 TMA→mma，
+`empty[s]` 保证 mma→下一次复用该 stage 的 TMA。
 
-* (a) 4.1 的主要瓶颈是同步/普通 shared staging 与数据供给；4.2 降低线程搬运开销后，等待 TMA 延迟更明显；4.3 通过多级缓冲把 TMA 与 mma 重叠，瓶颈转向 Tensor Core 吞吐、TMEM/shared 容量或剩余同步。
-* (b) 梯子：tiled 减少 global 重复访问并提高 tile 复用；TMA 减少地址计算、线程 load/store 与搬运同步；pipeline 隐藏 global→shared 延迟。
-* (c) 扩大 tile/增加 stages 首先受 **shared memory** 容量和 resident block 数约束；TMEM 也随输出 tile 的 M×N 累加器增长。3.4 的 CTA pair 仅减少 B staging 的 shared 占用，不能消除 TMEM 的输出容量约束。最终先达到哪项由 `cudaOccupancy`/编译资源报告填写。
+**(a) 瓶颈变化。** 4.1 的热点是普通线程执行的 global load、swizzle
+地址计算和 shared store，主要表现为 staging 指令及 long-scoreboard 等待。
+4.2 用 TMA 消掉这批普通 CUDA 指令后，单缓冲的 `empty` 依赖使下一轮 TMA
+必须等待当前 mma 消费完 shared tile。4.3 在语义上解除了这个串行依赖，
+让不同 stage 的 TMA 和 mma 重叠；但当前 tile/grid 上，新增 shared memory
+降低 occupancy 的代价更大。S=3 只有 257.9 TFLOPS，低于 4.2 的
+340.3 TFLOPS，因此瓶颈并没有转成“Tensor Core 已打满”，而是转成了
+shared-memory 容量造成的低 CTA/warp 并发，以及仍存在的 barrier 和串行
+producer/consumer 控制开销。
+
+**(b) 梯子逐级归因。** assignment01 naive 每个输出元素直接从 global
+读取输入并用普通 fp32 运算；4.1 用 shared tile 复用 A/B、用 TMEM 保存跨 K
+累加器并使用 Tensor Core，减少重复 global 流量。4.1→4.2 把二维地址生成、
+global load、swizzle 和 shared store 从普通线程指令卸载给 TMA。4.2→4.3
+增加循环缓冲，减少“本轮 mma 完成后才能发下一轮 TMA”的暴露延迟，但以
+每 stage 24576 B shared memory 和更多 mbarrier 状态为代价；本次实测该
+交换在大 grid 上是负收益。
+
+**(c) 容量限制。** 固定 `BM=128, BN=64, BK=64` 只增加 stage 时，TMEM
+中的输出累加器不随 S 增长，每 CTA 始终占 `128×64×4=32768 B`；shared
+memory 却每增加一级增长 24576 B，所以首先限制 residency 的一定是 shared
+memory，S=6 已只允许 1 block/SM。若继续扩大输出 tile，TMEM 也会随
+`BM×BN` 增长并最终成为硬上限。3.4 的 `cta_group::2` 将每 CTA 的 B staging
+减半，能把省下的 shared memory 用于更多 stage 或更大 tile，但不会减少
+输出 accumulator 所需的 TMEM；因此它只能推迟 shared-memory 上限，不能
+消除后续的 TMEM 容量限制。
 
 ### 4.4 Optional
 

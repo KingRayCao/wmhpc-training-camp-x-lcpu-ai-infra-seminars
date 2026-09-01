@@ -32,8 +32,10 @@
 constexpr int BM = 128, BN = 64, BK = 64;
 
 // SM100 smem descriptor(与 4.1 相同;swz128 已经不需要了)。
-__device__ inline uint64_t make_desc_sm100(uint32_t saddr, uint32_t lbo,
-                                           uint32_t sbo, uint32_t layout) {
+__device__ inline uint64_t make_desc_sm100(uint32_t saddr,
+                                           uint32_t lbo,
+                                           uint32_t sbo,
+                                           uint32_t layout) {
     uint64_t d = 0;
     d |= (uint64_t)((saddr >> 4) & 0x3FFF);
     d |= (uint64_t)((lbo >> 4) & 0x3FFF) << 16;
@@ -54,13 +56,19 @@ __device__ inline void mbar_wait(uint32_t mbar, uint32_t phase) {
             : "r"(mbar), "r"(phase));
 }
 
-__global__ void gemm_tma(const __nv_bfloat16* gA, const __nv_bfloat16* gB,
-                         float* gD, int M, int N, int K,
+__global__ void gemm_tma(const __nv_bfloat16* gA,
+                         const __nv_bfloat16* gB,
+                         float* gD,
+                         int M,
+                         int N,
+                         int K,
                          const __grid_constant__ CUtensorMap tmapA,
                          const __grid_constant__ CUtensorMap tmapB) {
     extern __shared__ uint8_t smem_raw[];
-    uint8_t* smem =
-        (uint8_t*)(((uintptr_t)smem_raw + 1023) & ~(uintptr_t)1023);
+    uint8_t* smem = (uint8_t*)(((uintptr_t)smem_raw + 1023) & ~(uintptr_t)1023);
+    uint8_t *sA = smem, *sB = smem + BM * BK * sizeof(__nv_bfloat16);
+    uint32_t aBase = (uint32_t)__cvta_generic_to_shared(sA),
+             bBase = (uint32_t)__cvta_generic_to_shared(sB);
 
     // TODO:把你 4.1 的 kernel 搬进来,K 循环的 staging 部分改为:
     // (1) 多初始化一组 mbarrier:full(TMA 到达)。4.1 里等 mma 消费
@@ -74,8 +82,126 @@ __global__ void gemm_tma(const __nv_bfloat16* gA, const __nv_bfloat16* gB,
     //     A 是 {it*BK, tileM},B 是 {it*BK, tileN}
     // (3) 删掉 st.shared staging、swz128、fence.proxy.async(见文件头)
     // full/empty 的 parity 都随轮次翻转,想清楚各自翻转的节奏。
-    (void)gA; (void)gB; (void)gD; (void)M; (void)N; (void)K;
-    (void)tmapA; (void)tmapB; (void)smem;
+
+    __shared__ __align__(8) uint64_t mbar_full, mbar_empty;
+    __shared__ uint32_t s_taddr[1];
+    int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    uint32_t mbar_full_u32 = (uint32_t)__cvta_generic_to_shared(&mbar_full);
+    uint32_t mbar_empty_u32 = (uint32_t)__cvta_generic_to_shared(&mbar_empty);
+    uint32_t phase_full = 0, phase_empty = 0;
+
+    if (warp == 0) {
+        if (lane == 0) {
+            asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
+                         :
+                         : "r"(mbar_full_u32), "r"(1));
+            asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
+                         :
+                         : "r"(mbar_empty_u32), "r"(1));
+            asm volatile("fence.mbarrier_init.release.cluster;");
+        }
+        uint32_t dst = (uint32_t)__cvta_generic_to_shared(s_taddr);
+        asm volatile(
+            "tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], "
+            "%1;" ::"r"(dst),
+            "r"(BN));
+        asm volatile(
+            "tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
+    }
+    __syncthreads();
+    uint32_t taddr = s_taddr[0];
+
+    uint32_t tileM = blockIdx.x * BM, tileN = blockIdx.y * BN;
+    uint32_t tmaBytes = (BM + BN) * BK * sizeof(__nv_bfloat16);
+    uint32_t idesc =
+        (1u << 4) | (1u << 7) | (1u << 10) | (8u << 17) | (8u << 24);
+
+    for (int it = 0; it < K; it += BK) {
+        if (warp == 0 && lane == 0) {
+            asm volatile(
+                "mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;"
+                :
+                : "r"(mbar_full_u32), "r"(tmaBytes)
+                : "memory");
+            asm volatile(
+                "cp.async.bulk.tensor.2d.shared::cluster.global.tile."
+                "mbarrier::complete_tx::bytes "
+                "[%0], [%1, {%2, %3}], [%4];"
+                :
+                : "r"(aBase), "l"(&tmapA), "r"(it), "r"(tileM),
+                  "r"(mbar_full_u32)
+                : "memory");
+            asm volatile(
+                "cp.async.bulk.tensor.2d.shared::cluster.global.tile."
+                "mbarrier::complete_tx::bytes "
+                "[%0], [%1, {%2, %3}], [%4];"
+                :
+                : "r"(bBase), "l"(&tmapB), "r"(it), "r"(tileN),
+                  "r"(mbar_full_u32)
+                : "memory");
+        }
+
+        __syncthreads();
+
+        uint32_t elected;
+        asm volatile(
+            "{\n.reg .pred P;\nelect.sync _|P, 0xFFFFFFFF;\nselp.b32 %0, 1, 0, "
+            "P;\n}"
+            : "=r"(elected));
+
+        if (warp == 0 && elected) {
+            mbar_wait(mbar_full_u32, phase_full);
+            phase_full ^= 1;
+            for (int round = 0; round < BK / 16; round++) {
+                int kk = round * 16;
+
+                asm volatile("tcgen05.fence::after_thread_sync;");
+                uint64_t da = make_desc_sm100(aBase + kk * 2, 0, 1024, 2);
+                uint64_t db = make_desc_sm100(bBase + kk * 2, 0, 1024, 2);
+                uint32_t accum = (round == 0 && it == 0) ? 0 : 1;
+                asm volatile(
+                    "{\n.reg .pred p;\nsetp.ne.b32 p, %4, 0;\n"
+                    "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, "
+                    "p;\n}\n"
+                    :
+                    : "r"(taddr), "l"(da), "l"(db), "r"(idesc), "r"(accum)
+                    : "memory");
+            }
+
+            asm volatile(
+                "tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::"
+                "cluster.b64 [%0];"
+                :
+                : "r"(mbar_empty_u32)
+                : "memory");
+        }
+        mbar_wait(mbar_empty_u32, phase_empty);
+        phase_empty ^= 1;
+    }
+    asm volatile("tcgen05.fence::after_thread_sync;");
+    for (int c = 0; c < BN; c += 8) {
+        uint32_t src = taddr + ((uint32_t)(warp * 32) << 16) + c;
+        float r[8];
+        asm volatile(
+            "tcgen05.ld.sync.aligned.32x32b.x8.b32 "
+            "{%0,%1,%2,%3,%4,%5,%6,%7}, [%8];"
+            : "=f"(r[0]), "=f"(r[1]), "=f"(r[2]), "=f"(r[3]), "=f"(r[4]),
+              "=f"(r[5]), "=f"(r[6]), "=f"(r[7])
+            : "r"(src));
+        asm volatile("tcgen05.wait::ld.sync.aligned;");
+        int row = warp * 32 + lane;
+#pragma unroll
+        for (int i = 0; i < 8; i++)
+            gD[(row + tileM) * N + tileN + c + i] = r[i];
+        __syncthreads();
+    }
+    // (5) dealloc
+    __syncthreads();
+    if (warp == 0)
+        asm volatile(
+            "tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" ::"r"(
+                taddr),
+            "r"(64));
 }
 
 int main(int argc, char** argv) {
@@ -90,8 +216,10 @@ int main(int argc, char** argv) {
     std::mt19937 rng(42);
     std::uniform_int_distribution<int> dist(-3, 3);
     std::vector<__nv_bfloat16> hA(nA), hB(nB);
-    for (auto& v : hA) v = __float2bfloat16((float)dist(rng));
-    for (auto& v : hB) v = __float2bfloat16((float)dist(rng));
+    for (auto& v : hA)
+        v = __float2bfloat16((float)dist(rng));
+    for (auto& v : hB)
+        v = __float2bfloat16((float)dist(rng));
     __nv_bfloat16 *dA, *dB;
     float *dD, *dRef;
     CUDA_CHECK(cudaMalloc(&dA, nA * 2));
@@ -106,12 +234,37 @@ int main(int argc, char** argv) {
     // 返回值要检查,CUDA_SUCCESS 之外一律报错退出——tensor map 参数错
     // 的典型症状是 kernel 静默读到 0 或越界,而不是启动失败)。
     CUtensorMap tmapA = {}, tmapB = {};
+    uint64_t globalDimA[2] = {(uint64_t)K, (uint64_t)M};
+    uint64_t globalDimB[2] = {(uint64_t)K, (uint64_t)N};
+    uint64_t globalStrides[1] = {(uint64_t)K * 2};
+    uint32_t boxDimA[2] = {BK, BM};
+    uint32_t boxDimB[2] = {BK, BN};
+    uint32_t elementStrides[2] = {1, 1};
+    CU_CHECK(cuTensorMapEncodeTiled(
+        &tmapA, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+        2,               // 二维
+        dA,              // global memory 基址
+        globalDimA,      // {K, M}
+        globalStrides,   // {K * sizeof(bf16)}
+        boxDimA,         // {BK, BM}
+        elementStrides,  // {1, 1}
+        CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
+        CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+    CU_CHECK(cuTensorMapEncodeTiled(
+        &tmapB, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+        2,               // 二维
+        dB,              // global memory 基址
+        globalDimB,      // {K, N}
+        globalStrides,   // {K * sizeof(bf16)}
+        boxDimB,         // {BK, BN}
+        elementStrides,  // {1, 1}
+        CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
+        CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
 
     dim3 grid(M / BM, N / BN);
     size_t smemBytes = (size_t)(BM + BN) * BK * 2 + 1024;
-    CUDA_CHECK(cudaFuncSetAttribute(gemm_tma,
-                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                    (int)smemBytes));
+    CUDA_CHECK(cudaFuncSetAttribute(
+        gemm_tma, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smemBytes));
     auto launch = [&] {
         gemm_tma<<<grid, 128, smemBytes>>>(dA, dB, dD, M, N, K, tmapA, tmapB);
     };
@@ -129,7 +282,8 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMemcpy(got.data(), dD, nD * 4, cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(ref.data(), dRef, nD * 4, cudaMemcpyDeviceToHost));
     long bad = 0;
-    for (size_t i = 0; i < nD; i++) bad += got[i] != ref[i];
+    for (size_t i = 0; i < nD; i++)
+        bad += got[i] != ref[i];
 
     int iters = (size_t)M * N >= (size_t)4096 * 4096 ? 20 : 100;
     float ms = time_avg_ms(launch, iters);
@@ -143,10 +297,11 @@ int main(int argc, char** argv) {
         },
         iters);
     double cub_tflops = 2.0 * M * N * K / (cub_ms * 1e9);
-    printf("[4.2 tma] M=%d N=%d K=%d  %s(bad=%ld)  %.2f ms  %.1f TFLOPS  "
-           "(cuBLAS %.1f, 达成率 %.0f%%)\n",
-           M, N, K, bad ? "FAIL" : "PASS", bad, ms, tflops, cub_tflops,
-           100.0 * tflops / cub_tflops);
+    printf(
+        "[4.2 tma] M=%d N=%d K=%d  %s(bad=%ld)  %.2f ms  %.1f TFLOPS  "
+        "(cuBLAS %.1f, 达成率 %.0f%%)\n",
+        M, N, K, bad ? "FAIL" : "PASS", bad, ms, tflops, cub_tflops,
+        100.0 * tflops / cub_tflops);
     cublasDestroy(h);
     return bad != 0;
 }

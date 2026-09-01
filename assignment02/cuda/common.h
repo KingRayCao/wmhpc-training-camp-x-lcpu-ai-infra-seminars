@@ -18,6 +18,21 @@
         }                                                                 \
     } while (0)
 
+#define CU_CHECK(call)                                                   \
+    do {                                                                 \
+        CUresult result_ = (call);                                       \
+        if (result_ != CUDA_SUCCESS) {                                   \
+            const char* name_ = nullptr;                                 \
+            const char* message_ = nullptr;                              \
+            cuGetErrorName(result_, &name_);                             \
+            cuGetErrorString(result_, &message_);                        \
+            fprintf(stderr, "CUDA Driver error %s at %s:%d: %s\n",       \
+                    name_ ? name_ : "unknown", __FILE__, __LINE__,        \
+                    message_ ? message_ : "unknown");                     \
+            exit(1);                                                     \
+        }                                                                \
+    } while (0)
+
 #define CUDA_CHECK_KERNEL()                        \
     do {                                           \
         CUDA_CHECK(cudaGetLastError());            \
