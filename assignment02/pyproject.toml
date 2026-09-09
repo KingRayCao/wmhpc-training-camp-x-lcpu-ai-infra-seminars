@@ -10,3 +10,4 @@ tilelang = ["tilelang==0.1.13"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]

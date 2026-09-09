@@ -29,12 +29,40 @@ template <int BLOCK>
 __global__ void nvfp4_quant_kernel(const __nv_bfloat16* __restrict__ in,
                                    uint8_t* __restrict__ dataOut,
                                    uint8_t* __restrict__ sfOut, int M, int K) {
-    // TODO: 实现。
+    int row, kGroup;
+    int groupsPerRow = K / 16;
+    int totalGroups = M * groupsPerRow;
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
+    float fin[16], amax;
+    for (int groupId = tid; groupId < totalGroups; groupId += stride){
+        row = groupId / groupsPerRow;
+        kGroup = groupId % groupsPerRow;
+        int elementBase = groupId * 16;
+        amax = 0.0f;
+        for (int j = 0; j < 16; j++){
+            fin[j] = float(in[elementBase+j]);
+            if(fabsf(fin[j]) > amax){
+                amax = fabsf(fin[j]);
+            }
+        }
+        __nv_fp8_e4m3 sf8  = __nv_fp8_e4m3(amax / 6.0f);
+        float sf = float(sf8);
+        float inv = sf != 0 ? 1.0f / sf : 0.0f;
+        for(int j = 0; j < 16; j+=2){
+            dataOut[row * K / 2+ kGroup * 8 + j / 2] = (__nv_fp4x2_e2m1(make_float2(fin[j] * inv, fin[j+1] * inv))).__x;
+        }
+        sfOut[sf_swizzled_offset(row, kGroup, nvfp4_num_ktiles(K))] = sf8.__x;
+    }
 }
 
 // 判测和 5.4 会按这个签名调用;grid 大小你自己定,写在这里。
 inline void launch_nvfp4_quant(const __nv_bfloat16* in, uint8_t* dataOut,
                                uint8_t* sfOut, int M, int K, int sms) {
-    // TODO: 选择 grid/block 并启动 nvfp4_quant_kernel。
-    (void)in; (void)dataOut; (void)sfOut; (void)M; (void)K; (void)sms;
+    // 扫参结果：小 CTA 配合更多 CTA/SM 更适合这个独立 group kernel。
+    const int blocks = 128;
+    int totalGroups = M * K / 16;
+    int requiredBlocks = (totalGroups + blocks - 1) / blocks;
+    int gridNum = min(sms * 4, requiredBlocks);
+    nvfp4_quant_kernel<blocks><<<gridNum, blocks>>>(in, dataOut, sfOut, M, K);
 }

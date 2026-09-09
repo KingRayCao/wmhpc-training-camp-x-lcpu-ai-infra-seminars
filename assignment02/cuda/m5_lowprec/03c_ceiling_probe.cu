@@ -19,20 +19,49 @@ template <int BLOCK>
 __global__ void probe_kernel(const __nv_bfloat16* __restrict__ in,
                              uint8_t* __restrict__ dataOut,
                              uint8_t* __restrict__ sfOut, int M, int K) {
-    // TODO: 与你的 quant kernel 同形的访存,xor 直通,无数学。
+    // 一个线程处理一个 16 元素 quant group，按原始位折叠后同形写回。
+    int row, kGroup;
+    int groupsPerRow = K / 16;
+    int totalGroups = M * groupsPerRow;
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
+    uint16_t raw[16];
+    uint8_t folded[8];
+    for (int groupId = tid; groupId < totalGroups; groupId += stride){
+        row = groupId / groupsPerRow;
+        kGroup = groupId % groupsPerRow;
+        int elementBase = groupId * 16;
+        for (int j = 0; j < 16; j++){
+            raw[j] = static_cast<__nv_bfloat16_raw>(in[elementBase + j]).x;
+        }
+        for (int pair = 0; pair < 8; pair++) {
+            uint16_t mixed = raw[pair * 2] ^ raw[pair * 2 + 1];
+            folded[pair] = static_cast<uint8_t>(mixed ^ (mixed >> 8));
+            dataOut[row * K / 2 + kGroup * 8 + pair] = folded[pair];
+        }
+        uint8_t sfDummy = folded[0] ^ folded[7];
+        sfOut[sf_swizzled_offset(row, kGroup, nvfp4_num_ktiles(K))] =
+            sfDummy;
+    }
 }
 
 static void launch_probe(const __nv_bfloat16* in, uint8_t* dataOut,
                          uint8_t* sfOut, int M, int K, int sms) {
-    // TODO: 启动配置。
-    (void)in; (void)dataOut; (void)sfOut; (void)M; (void)K; (void)sms;
+    const int blockThreads = 128;
+    int totalGroups = M * K / 16;
+    int requiredBlocks = (totalGroups + blockThreads - 1) / blockThreads;
+    int gridNum = min(sms * 4, requiredBlocks);
+    probe_kernel<blockThreads><<<gridNum, blockThreads>>>(in, dataOut, sfOut,
+                                                          M, K);
 }
 
 int main() {
     int sms;
     CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0));
     for (const auto& shape :
-         {std::pair{4096, 7168}, {16384, 4096}, {16384, 8192}}) {
+         {std::pair{1, 4096}, {16, 4096}, {256, 4096}, {1024, 4096},
+          {4096, 4096}, {16384, 4096}, {4096, 7168}, {16384, 7168},
+          {4096, 8192}, {16384, 8192}}) {
         int M = shape.first;
         int K = shape.second;
         size_t n = (size_t)M * K;

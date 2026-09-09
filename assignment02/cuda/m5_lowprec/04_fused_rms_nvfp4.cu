@@ -19,28 +19,28 @@
 //
 // 判测口径:sumsq 归约顺序不同会让极少数处在舍入边界的值翻转,
 // 允许 1e-4 比例的 byte 不一致(host 参考的 sumsq 用 double)。
-#include <vector>
-#include <random>
 #include "../common.h"
-#include "nvfp4_common.h"
 #include "e2m1_encode.h"
+#include "nvfp4_common.h"
 #include "nvfp4_quant_kernel.h"
+#include <random>
+#include <vector>
 
 // 给定的两步基线第一步:block-per-row 的 rms_norm,bf16 进出。
 // 允许修改或另写(公平基线的一部分:它调多快,对比就有多可信)。
 template <int BLOCK>
-__global__ void rms_norm_baseline_kernel(const __nv_bfloat16* __restrict__ in,
-                                         const __nv_bfloat16* __restrict__ w,
-                                         __nv_bfloat16* __restrict__ out,
-                                         int M, int K, float eps) {
+__global__ void rms_norm_baseline_kernel(const __nv_bfloat16 *__restrict__ in,
+                                         const __nv_bfloat16 *__restrict__ w,
+                                         __nv_bfloat16 *__restrict__ out, int M,
+                                         int K, float eps) {
     __shared__ float red[BLOCK / 32];
     for (int row = blockIdx.x; row < M; row += gridDim.x) {
-        const __nv_bfloat16* xr = in + (size_t)row * K;
+        const __nv_bfloat16 *xr = in + (size_t)row * K;
         float ss = 0.f;
         for (int k = threadIdx.x * 8; k < K; k += BLOCK * 8) {
-            float4 raw = *reinterpret_cast<const float4*>(xr + k);
-            const __nv_bfloat162* h =
-                reinterpret_cast<const __nv_bfloat162*>(&raw);
+            float4 raw = *reinterpret_cast<const float4 *>(xr + k);
+            const __nv_bfloat162 *h =
+                reinterpret_cast<const __nv_bfloat162 *>(&raw);
 #pragma unroll
             for (int i = 0; i < 4; i++) {
                 float2 f = __bfloat1622float2(h[i]);
@@ -48,24 +48,28 @@ __global__ void rms_norm_baseline_kernel(const __nv_bfloat16* __restrict__ in,
             }
         }
 #pragma unroll
-        for (int o = 16; o; o >>= 1) ss += __shfl_down_sync(~0u, ss, o);
-        if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = ss;
+        for (int o = 16; o; o >>= 1)
+            ss += __shfl_down_sync(~0u, ss, o);
+        if ((threadIdx.x & 31) == 0)
+            red[threadIdx.x >> 5] = ss;
         __syncthreads();
         if (threadIdx.x < 32) {
             ss = threadIdx.x < BLOCK / 32 ? red[threadIdx.x] : 0.f;
 #pragma unroll
-            for (int o = 16; o; o >>= 1) ss += __shfl_down_sync(~0u, ss, o);
-            if (threadIdx.x == 0) red[0] = ss;
+            for (int o = 16; o; o >>= 1)
+                ss += __shfl_down_sync(~0u, ss, o);
+            if (threadIdx.x == 0)
+                red[0] = ss;
         }
         __syncthreads();
         float rnorm = 1.0f / sqrtf(red[0] / K + eps);
         for (int k = threadIdx.x * 8; k < K; k += BLOCK * 8) {
-            float4 raw = *reinterpret_cast<const float4*>(xr + k);
-            float4 raww = *reinterpret_cast<const float4*>(w + k);
-            const __nv_bfloat162* h =
-                reinterpret_cast<const __nv_bfloat162*>(&raw);
-            const __nv_bfloat162* hw =
-                reinterpret_cast<const __nv_bfloat162*>(&raww);
+            float4 raw = *reinterpret_cast<const float4 *>(xr + k);
+            float4 raww = *reinterpret_cast<const float4 *>(w + k);
+            const __nv_bfloat162 *h =
+                reinterpret_cast<const __nv_bfloat162 *>(&raw);
+            const __nv_bfloat162 *hw =
+                reinterpret_cast<const __nv_bfloat162 *>(&raww);
             __nv_bfloat162 o2[4];
 #pragma unroll
             for (int i = 0; i < 4; i++) {
@@ -74,35 +78,126 @@ __global__ void rms_norm_baseline_kernel(const __nv_bfloat16* __restrict__ in,
                 o2[i] = __floats2bfloat162_rn(f.x * rnorm * fw.x,
                                               f.y * rnorm * fw.y);
             }
-            *reinterpret_cast<float4*>(
-                const_cast<__nv_bfloat16*>(out) + (size_t)row * K + k) =
-                *reinterpret_cast<float4*>(o2);
+            *reinterpret_cast<float4 *>(const_cast<__nv_bfloat16 *>(out) +
+                                        (size_t)row * K + k) =
+                *reinterpret_cast<float4 *>(o2);
         }
         __syncthreads();
     }
 }
 
-// TODO(核心):融合 kernel。签名自定,在 launch_fused 里接上。
-static void launch_fused(const __nv_bfloat16* in, const __nv_bfloat16* w,
-                         uint8_t* dataOut, uint8_t* sfOut, int M, int K,
-                         float eps, int sms) {
-    // TODO
-    (void)in; (void)w; (void)dataOut; (void)sfOut; (void)M; (void)K;
-    (void)eps; (void)sms;
+// 一个 CTA 依次完成一行的 RMS 归约和 NVFP4 量化。
+template <int BLOCK>
+__global__ void fused_rms_quant_kernel(const __nv_bfloat16 *__restrict__ in,
+                                       const __nv_bfloat16 *__restrict__ w,
+                                       uint8_t *__restrict__ dataOut,
+                                       uint8_t *__restrict__ sfOut, int M,
+                                       int K, float eps) {
+    __shared__ float red[BLOCK / 32];
+    for (int row = blockIdx.x; row < M; row += gridDim.x) {
+        const __nv_bfloat16 *xr = in + (size_t)row * K;
+        float ss = 0.f;
+        for (int k = threadIdx.x * 8; k < K; k += BLOCK * 8) {
+            float4 raw = *reinterpret_cast<const float4 *>(xr + k);
+            const __nv_bfloat162 *h =
+                reinterpret_cast<const __nv_bfloat162 *>(&raw);
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+                float2 f = __bfloat1622float2(h[i]);
+                ss += f.x * f.x + f.y * f.y;
+            }
+        }
+#pragma unroll
+        for (int o = 16; o; o >>= 1)
+            ss += __shfl_down_sync(~0u, ss, o);
+        if ((threadIdx.x & 31) == 0)
+            red[threadIdx.x >> 5] = ss;
+        __syncthreads();
+        if (threadIdx.x < 32) {
+            ss = threadIdx.x < BLOCK / 32 ? red[threadIdx.x] : 0.f;
+            for (int o = 16; o; o >>= 1)
+                ss += __shfl_down_sync(~0u, ss, o);
+            if (threadIdx.x == 0)
+                red[0] = ss;
+        }
+        __syncthreads();
+        float row_ss = red[0];
+        __syncthreads();
+        float rnorm = 1.0f / sqrtf(row_ss / K + eps);
+        for (int k = threadIdx.x * NVFP4_GROUP; k < K;
+             k += BLOCK * NVFP4_GROUP) {
+            float amax = 0.f;
+            float value[NVFP4_GROUP];
+#pragma unroll
+            for (int i = 0; i < NVFP4_GROUP; i += 8) {
+                int idx = k + i;
+                if (idx < K) {
+                    float4 raw = *reinterpret_cast<const float4 *>(xr + idx);
+                    float4 raww = *reinterpret_cast<const float4 *>(w + idx);
+                    const __nv_bfloat162 *h =
+                        reinterpret_cast<const __nv_bfloat162 *>(&raw);
+                    const __nv_bfloat162 *hw =
+                        reinterpret_cast<const __nv_bfloat162 *>(&raww);
+#pragma unroll
+                    for (int j = 0; j < 4; j++) {
+                        float2 f = __bfloat1622float2(h[j]);
+                        float2 fw = __bfloat1622float2(hw[j]);
+                        value[i + j * 2] = f.x * rnorm * fw.x;
+                        value[i + j * 2 + 1] = f.y * rnorm * fw.y;
+                        amax = fmaxf(amax, fabsf(value[i + j * 2]));
+                        amax = fmaxf(amax, fabsf(value[i + j * 2 + 1]));
+                    }
+                }
+            }
+            __nv_fp8_e4m3 sf8 = __nv_fp8_e4m3(amax / 6.0f);
+            float s = float(sf8);
+            float inv = s != 0.f ? 1.0f / s : 0.f;
+            for (int i = 0; i < NVFP4_GROUP; i += 2) {
+                int idx = k + i;
+                dataOut[(size_t)row * K / 2 + idx / 2] =
+                    (__nv_fp4x2_e2m1(make_float2(value[i] * inv,
+                                                  value[i + 1] * inv)))
+                        .__x;
+            }
+            int kGroup = k / NVFP4_GROUP;
+            sfOut[sf_swizzled_offset(row, kGroup, nvfp4_num_ktiles(K))] =
+                sf8.__x;
+        }
+    }
 }
 
-// TODO(公平基线):两步各自的最优启动配置。默认给的是一个起点。
-static void launch_two_step(const __nv_bfloat16* in, const __nv_bfloat16* w,
-                            __nv_bfloat16* mid, uint8_t* dataOut,
-                            uint8_t* sfOut, int M, int K, float eps,
-                            int sms) {
-    int grid = M < sms ? M : sms * 2;
-    rms_norm_baseline_kernel<512><<<grid, 512>>>(in, w, mid, M, K, eps);
+static void launch_fused(const __nv_bfloat16 *in, const __nv_bfloat16 *w,
+                         uint8_t *dataOut, uint8_t *sfOut, int M, int K,
+                         float eps, int sms) {
+    if (M < 1024) {
+        fused_rms_quant_kernel<512><<<M, 512>>>(in, w, dataOut, sfOut, M, K,
+                                                eps);
+    } else {
+        int grid = min(M, sms * 8);
+        fused_rms_quant_kernel<128><<<grid, 128>>>(in, w, dataOut, sfOut, M, K,
+                                                   eps);
+    }
+}
+// RMS 与 quant 各自使用扫参得到的启动配置，保证两步基线公平。
+static void launch_two_step(const __nv_bfloat16 *in, const __nv_bfloat16 *w,
+                            __nv_bfloat16 *mid, uint8_t *dataOut,
+                            uint8_t *sfOut, int M, int K, float eps, int sms) {
+    if (M < 1024) {
+        rms_norm_baseline_kernel<512><<<M, 512>>>(in, w, mid, M, K, eps);
+    } else {
+        int grid = min(M, sms * 8);
+        if (K == 7168)
+            rms_norm_baseline_kernel<256><<<grid, 256>>>(in, w, mid, M, K,
+                                                         eps);
+        else
+            rms_norm_baseline_kernel<128><<<grid, 128>>>(in, w, mid, M, K,
+                                                         eps);
+    }
     launch_nvfp4_quant(mid, dataOut, sfOut, M, K, sms);
 }
 
-static void host_ref(const std::vector<float>& x, const std::vector<float>& w,
-                     int M, int K, float eps, std::vector<uint8_t>& data) {
+static void host_ref(const std::vector<float> &x, const std::vector<float> &w,
+                     int M, int K, float eps, std::vector<uint8_t> &data) {
     int numKTiles = nvfp4_num_ktiles(K);
     (void)numKTiles;
     data.assign((size_t)M * K / 2, 0);
@@ -138,10 +233,16 @@ int main() {
     printf("# %-6s %-6s %10s %10s %8s\n", "M", "K", "2step_us", "fused_us",
            "speedup");
     long total_bad = 0;
-    for (const auto& shape :
-         {std::pair{1, 4096}, {16, 4096}, {256, 4096}, {1024, 4096},
-          {4096, 4096}, {16384, 4096}, {4096, 7168}, {16384, 7168},
-          {4096, 8192}, {16384, 8192}}) {
+    for (const auto &shape : {std::pair{1, 4096},
+                              {16, 4096},
+                              {256, 4096},
+                              {1024, 4096},
+                              {4096, 4096},
+                              {16384, 4096},
+                              {4096, 7168},
+                              {16384, 7168},
+                              {4096, 8192},
+                              {16384, 8192}}) {
         int M = shape.first;
         int K = shape.second;
         size_t n = (size_t)M * K;
@@ -166,8 +267,8 @@ int main() {
         CUDA_CHECK(cudaMalloc(&dd, n / 2));
         CUDA_CHECK(cudaMalloc(&dsf, sfB));
         CUDA_CHECK(cudaMemcpy(dx, hx.data(), n * 2, cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(dw, hw.data(), (size_t)K * 2,
-                              cudaMemcpyHostToDevice));
+        CUDA_CHECK(
+            cudaMemcpy(dw, hw.data(), (size_t)K * 2, cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemset(dsf, 0, sfB));
 
         launch_fused(dx, dw, dd, dsf, M, K, eps, sms);
@@ -176,7 +277,8 @@ int main() {
         CUDA_CHECK(cudaMemcpy(gd.data(), dd, n / 2, cudaMemcpyDeviceToHost));
         host_ref(hxf, hwf, M, K, eps, rd);
         long bad = 0;
-        for (size_t i = 0; i < gd.size(); i++) bad += gd[i] != rd[i];
+        for (size_t i = 0; i < gd.size(); i++)
+            bad += gd[i] != rd[i];
         bool pass = bad <= (long)(gd.size() / 10000) + 1;
         total_bad += !pass;
 
@@ -188,7 +290,10 @@ int main() {
             [&] { launch_fused(dx, dw, dd, dsf, M, K, eps, sms); }, iters);
         printf("  %-6d %-6d %10.2f %10.2f %7.2fx %s(bad=%ld)\n", M, K,
                t2 * 1e3, tf * 1e3, t2 / tf, pass ? "PASS" : "FAIL", bad);
-        cudaFree(dx); cudaFree(dw); cudaFree(dmid); cudaFree(dd);
+        cudaFree(dx);
+        cudaFree(dw);
+        cudaFree(dmid);
+        cudaFree(dd);
         cudaFree(dsf);
     }
     return total_bad != 0;
